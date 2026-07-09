@@ -29,6 +29,21 @@ jobs:
         npm install
         npx playwright install-deps chrome
       
+    - name: Setup WARP
+      uses: fscarmen/warp-on-actions@v1.3
+      with:
+        stack: dual
+        mode: client
+
+    - name: Fix DNS
+      run: |
+        sudo systemctl stop systemd-resolved 2>/dev/null || true
+        sudo systemctl disable systemd-resolved 2>/dev/null || true
+        sudo rm -f /etc/resolv.conf
+        echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+        echo "Public IP: $(curl -s --max-time 10 https://api.ipify.org)"
+        curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+
     - name: Run Renew Script
       env:
         # 将 USERS_JSON 配置在 GitHub Repository Secrets 中
