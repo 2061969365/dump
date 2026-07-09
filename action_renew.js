@@ -169,6 +169,7 @@ async function launchChrome() {
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-gpu',
+        '--disable-software-rasterizer',
         `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -179,17 +180,22 @@ async function launchChrome() {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
         args.push('--proxy-bypass-list=<-loopback>');
     }
+    let chromeStderr = '';
     const chrome = spawn(CHROME_PATH, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', 'ignore', 'pipe']
+    });
+    chrome.stderr.on('data', (data) => {
+        chromeStderr += data.toString();
     });
     chrome.unref();
     console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
         if (await checkPort(DEBUG_PORT)) break;
         await new Promise(r => setTimeout(r, 1000));
     }
     if (!await checkPort(DEBUG_PORT)) {
+        console.error('[Chrome stderr]:', chromeStderr.slice(-500));
         throw new Error('Chrome 启动失败');
     }
 }
