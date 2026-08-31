@@ -707,6 +707,20 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
     const finalStatus = await getAltchaStatus(page);
     console.log(`[${stageName}] 检测到 ALTCHA，但在 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒内未能通过验证。最终状态: ${formatAltchaStatus(finalStatus)}`);
+    // 兼容：ALTCHA 组件存在但一直为 0 尺寸 / 无 shadow（截图中 modal 无验证码，实际无需验证）则放行，避免误判为失败
+    if (finalStatus.exists && !finalStatus.hasShadowRoot && finalStatus.valueLength === 0 && finalStatus.hiddenInputLength === 0) {
+        // 再检查一次 DOM 尺寸
+        const isHidden = await page.evaluate(() => {
+            const w = document.querySelector('altcha-widget');
+            if (!w) return true;
+            const r = w.getBoundingClientRect();
+            return r.width === 0 && r.height === 0;
+        }).catch(() => true);
+        if (isHidden) {
+            console.log(`[${stageName}] ALTCHA 组件隐藏/未初始化（0尺寸），视为无需验证，直接放行`);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -870,9 +884,10 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             } catch (e) {
                 console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
                 console.log(`   >> 当前 URL: ${page.url()}`);
+                let bodyText = '';
                 try {
-                    const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 800)).catch(() => '');
-                    console.log(`   >> 页面文本前800字: ${bodyText.replace(/\n/g, ' | ')}`);
+                    bodyText = await page.evaluate(() => document.body.innerText.slice(0, 1000)).catch(() => '');
+                    console.log(`   >> 页面文本前1000字: ${bodyText.replace(/\n/g, ' | ')}`);
                 } catch (err) {}
                 // 保存诊断截图
                 try {
@@ -881,6 +896,15 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                     const diagSafe = user.username.replace(/[^a-z0-9]/gi, '_');
                     await saveViewportScreenshot(page, path.join(diagDir, `${diagSafe}_see_notfound.png`)).catch(() => {});
                 } catch (err) {}
+                // 区分“无服务器”与“登录失败”：0 servers 时页面含 "You not have servers" / "0 Servers"
+                const isNoServers = bodyText.includes('You not have servers') || bodyText.includes('0 Servers') || bodyText.includes('0 servers');
+                if (isNoServers) {
+                    console.log(`   >> ℹ️ 账号 ${maskUsernameForLog(user.username)} 暂无服务器可续期，视为成功跳过`);
+                    succeededUsers.push(user.username);
+                    try { await saveViewportScreenshot(page, path.join(process.cwd(), 'screenshots', `${user.username.replace(/[^a-z0-9]/gi, '_')}_no_servers.png`)).catch(() => {}); } catch (err) {}
+                    await sendTelegramMessage(`ℹ️ *${escapeMarkdown(user.username)}*\n暂无服务器可续期，已跳过`, null).catch(() => {});
+                    continue;
+                }
                 hasFailure = true;
                 failedUsers.push({ username: user.username, reason: `未找到 See 按钮，登录可能失败 (url=${page.url()})` });
                 console.log(`::error::用户 ${maskUsernameForLog(user.username)} 未找到 See 按钮 url=${page.url()}`);
