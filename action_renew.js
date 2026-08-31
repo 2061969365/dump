@@ -486,35 +486,80 @@ async function attemptAltchaClick(page, currentStatus = null) {
                 return false;
             }
 
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(800);
             await altchaWidget.scrollIntoViewIfNeeded().catch(() => {});
+            // 等待 altcha-widget 完成初始化：shadowRoot 挂载且有尺寸（解决 2026-08-31 真跑中 shadow=false/width=0 问题）
+            for (let w = 0; w < 10; w++) {
+                const ready = await page.evaluate(() => {
+                    const widget = document.querySelector('altcha-widget');
+                    if (!widget) return { hasWidget: false };
+                    const rect = widget.getBoundingClientRect();
+                    return {
+                        hasWidget: true,
+                        hasShadow: !!widget.shadowRoot,
+                        rect: { width: rect.width, height: rect.height, x: rect.x, y: rect.y },
+                        hasCheckbox: !!(widget.shadowRoot && widget.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]')),
+                        state: widget.getAttribute('state') || widget.state || '',
+                        display: getComputedStyle(widget).display,
+                        visibility: getComputedStyle(widget).visibility
+                    };
+                });
+                if (ready.hasWidget && ready.rect.width > 0 && ready.hasShadow) break;
+                if (w === 2) console.log(`>> ALTCHA 等待初始化: ${JSON.stringify(ready)}`);
+                await page.waitForTimeout(500);
+            }
 
-            let boxInfo = await page.evaluate(() => {
-                const widget = document.querySelector('altcha-widget');
-                if (!widget) return null;
-
-                const pickClickTarget = (root) => {
-                    if (!root) return null;
-                    return root.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
-                };
-
-                if (widget.shadowRoot) {
-                    const target = pickClickTarget(widget.shadowRoot);
-                    if (target) {
-                        const rect = target.getBoundingClientRect();
-                        return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: target.tagName };
+            let boxInfo = null;
+            // 优先用 Playwright 的 boundingBox（更可靠），失败再用 evaluate
+            try {
+                const pwBox = await altchaWidget.boundingBox();
+                if (pwBox && pwBox.width > 0) {
+                    // 尝试在 shadow 内找精确 checkbox 坐标
+                    const shadowBox = await page.evaluate(() => {
+                        const widget = document.querySelector('altcha-widget');
+                        if (!widget || !widget.shadowRoot) return null;
+                        const cb = widget.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                        if (!cb) return null;
+                        const r = cb.getBoundingClientRect();
+                        if (r.width === 0) return null;
+                        return { x: r.left, y: r.top, width: r.width, height: r.height, tagName: cb.tagName };
+                    });
+                    if (shadowBox && shadowBox.width > 0) {
+                        boxInfo = { x: shadowBox.x, y: shadowBox.y, width: shadowBox.width, height: shadowBox.height, isExact: true, tagName: shadowBox.tagName };
+                    } else {
+                        boxInfo = { x: pwBox.x, y: pwBox.y, width: pwBox.width, height: pwBox.height, isExact: false, tagName: 'altcha-widget' };
                     }
                 }
+            } catch (e) { /* ignore */ }
 
-                const lightDomTarget = pickClickTarget(widget);
-                if (lightDomTarget) {
-                    const rect = lightDomTarget.getBoundingClientRect();
-                    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: lightDomTarget.tagName };
-                }
+            if (!boxInfo) {
+                boxInfo = await page.evaluate(() => {
+                    const widget = document.querySelector('altcha-widget');
+                    if (!widget) return null;
 
-                const rect = widget.getBoundingClientRect();
-                return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false, tagName: widget.tagName };
-            });
+                    const pickClickTarget = (root) => {
+                        if (!root) return null;
+                        return root.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                    };
+
+                    if (widget.shadowRoot) {
+                        const target = pickClickTarget(widget.shadowRoot);
+                        if (target) {
+                            const rect = target.getBoundingClientRect();
+                            return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: target.tagName };
+                        }
+                    }
+
+                    const lightDomTarget = pickClickTarget(widget);
+                    if (lightDomTarget) {
+                        const rect = lightDomTarget.getBoundingClientRect();
+                        return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: lightDomTarget.tagName };
+                    }
+
+                    const rect = widget.getBoundingClientRect();
+                    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false, tagName: widget.tagName };
+                });
+            }
 
             if (boxInfo && boxInfo.width > 0 && boxInfo.height > 0) {
                 let clickX, clickY;
@@ -542,6 +587,29 @@ async function attemptAltchaClick(page, currentStatus = null) {
 
                 return true;
             } else {
+                console.log('>> 未获取有效坐标，尝试直接通过 Playwright 点击 altcha-widget');
+                try {
+                    // 备用：直接点击 widget（Playwright 会自动处理 shadow DOM）
+                    await altchaWidget.click({ force: true, timeout: 3000 }).catch(() => {});
+                    await page.waitForTimeout(500);
+                    // 再尝试触发 shadow 内的 checkbox
+                    await page.evaluate(() => {
+                        const w = document.querySelector('altcha-widget');
+                        if (w && w.shadowRoot) {
+                            const cb = w.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]');
+                            if (cb) cb.click();
+                        }
+                    });
+                    // 检查是否进入 verifying/solved
+                    await page.waitForTimeout(800);
+                    const st = await getAltchaStatus(page);
+                    if (st.isVerifying || st.solved) {
+                        console.log(`>> 备用点击后 ALTCHA 状态: ${formatAltchaStatus(st)}`);
+                        return true;
+                    }
+                } catch (e2) {
+                    console.log('>> 备用点击失败:', e2.message);
+                }
                 console.log('>> 找到了 ALTCHA 元素，但获取不到有效大小，跳过点击。');
             }
         }
@@ -746,21 +814,46 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                // 检查登录错误
+                // 检查登录错误（扩大匹配，兼容中英文提示）
                 try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-                    if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ 登录失败: 账号或密码错误`);
-                        const failPhotoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-                        const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
-                        try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
-                        await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
-                        hasFailure = true;
-                        failedUsers.push({ username: user.username, reason: '登录失败: 账号或密码错误' });
-                        console.log(`::error::用户 ${maskUsernameForLog(user.username)} 登录失败: 账号或密码错误`);
-                        continue;
+                    await page.waitForTimeout(2500);
+                    // 等待可能跳转
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+                    const errorCandidates = [
+                        'Incorrect password or no account',
+                        'Incorrect password',
+                        'no account',
+                        'Invalid',
+                        'password',
+                        'Error',
+                        'Failed',
+                        '账号或密码错误'
+                    ];
+                    let loginErrorText = '';
+                    for (const txt of errorCandidates) {
+                        const loc = page.getByText(txt, { exact: false });
+                        if (await loc.first().isVisible({ timeout: 1000 }).catch(() => false)) {
+                            loginErrorText = await loc.first().innerText().catch(() => txt);
+                            break;
+                        }
+                    }
+                    // 也检查是否仍停留在 login 页
+                    const stillOnLogin = page.url().includes('login');
+                    if (loginErrorText || (stillOnLogin && !await page.getByRole('link', { name: 'See' }).first().isVisible({ timeout: 2000 }).catch(() => false))) {
+                        // 如果明确有错误提示，则判定为登录失败；若只是 See 未出现但无错误提示，则留给下一步统一处理
+                        if (loginErrorText) {
+                            console.error(`   >> ❌ 登录失败: ${loginErrorText}`);
+                            const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                            if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                            const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                            const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
+                            try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+                            await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: ${loginErrorText}`, failScreenshot);
+                            hasFailure = true;
+                            failedUsers.push({ username: user.username, reason: `登录失败: ${loginErrorText}` });
+                            console.log(`::error::用户 ${maskUsernameForLog(user.username)} 登录失败: ${loginErrorText} (url=${page.url()})`);
+                            continue;
+                        }
                     }
                 } catch (e) { }
 
@@ -776,9 +869,21 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
                 console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
+                console.log(`   >> 当前 URL: ${page.url()}`);
+                try {
+                    const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 800)).catch(() => '');
+                    console.log(`   >> 页面文本前800字: ${bodyText.replace(/\n/g, ' | ')}`);
+                } catch (err) {}
+                // 保存诊断截图
+                try {
+                    const diagDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(diagDir)) fs.mkdirSync(diagDir, { recursive: true });
+                    const diagSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                    await saveViewportScreenshot(page, path.join(diagDir, `${diagSafe}_see_notfound.png`)).catch(() => {});
+                } catch (err) {}
                 hasFailure = true;
-                failedUsers.push({ username: user.username, reason: '未找到 See 按钮，登录可能失败' });
-                console.log(`::error::用户 ${maskUsernameForLog(user.username)} 未找到 See 按钮`);
+                failedUsers.push({ username: user.username, reason: `未找到 See 按钮，登录可能失败 (url=${page.url()})` });
+                console.log(`::error::用户 ${maskUsernameForLog(user.username)} 未找到 See 按钮 url=${page.url()}`);
                 continue;
             }
 
