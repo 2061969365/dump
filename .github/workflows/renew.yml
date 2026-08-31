@@ -11,6 +11,8 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
@@ -63,10 +65,17 @@ jobs:
         path: screenshots/
         
     - name: Keepalive
+      # 始终执行但不掩盖之前的失败状态：若 renew 失败，workflow 仍为失败
+      if: always()
       run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           date -u > .keepalive
           git add .keepalive
-          git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
-          git push
+          # 只有文件有变更时才提交，避免 "nothing to commit" 导致步骤失败
+          if git diff --staged --quiet; then
+            echo "No keepalive changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: keepalive $(date -u +%Y-%m-%d) [skip ci]"
+          git push || echo "git push failed, ignored"

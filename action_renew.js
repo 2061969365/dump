@@ -697,6 +697,10 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
     await page.addInitScript(INJECTED_SCRIPT);
 
+    let hasFailure = false;
+    const failedUsers = [];
+    const succeededUsers = [];
+
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
@@ -753,6 +757,9 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
                         try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
                         await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
+                        hasFailure = true;
+                        failedUsers.push({ username: user.username, reason: '登录失败: 账号或密码错误' });
+                        console.log(`::error::用户 ${maskUsernameForLog(user.username)} 登录失败: 账号或密码错误`);
                         continue;
                     }
                 } catch (e) { }
@@ -769,6 +776,9 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
                 console.log('未找到 "See" 按钮 (可能登录未成功或界面变动)。');
+                hasFailure = true;
+                failedUsers.push({ username: user.username, reason: '未找到 See 按钮，登录可能失败' });
+                console.log(`::error::用户 ${maskUsernameForLog(user.username)} 未找到 See 按钮`);
                 continue;
             }
 
@@ -932,10 +942,18 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
                 try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
                 await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n${renewFailureReason}`, failScreenshot);
+                hasFailure = true;
+                failedUsers.push({ username: user.username, reason: renewFailureReason });
+                console.log(`::error::用户 ${maskUsernameForLog(user.username)} ${renewFailureReason}`);
+            } else {
+                succeededUsers.push(user.username);
             }
 
         } catch (err) {
-            console.error(`Error processing user:`, err);
+            console.error(`Error processing user ${maskUsernameForLog(user.username)}:`, err);
+            console.log(`::error::用户 ${maskUsernameForLog(user.username)} 处理异常: ${err.message}`);
+            hasFailure = true;
+            failedUsers.push({ username: user.username, reason: `异常: ${err.message}` });
         }
 
         const photoDir = path.join(process.cwd(), 'screenshots');
@@ -948,7 +966,38 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         console.log(`用户处理完成\n`);
     }
 
+    console.log('\n========== 执行汇总 ==========');
+    console.log(`✅ 成功: ${succeededUsers.length} 个 ${succeededUsers.length ? `(${succeededUsers.map(maskUsernameForLog).join(', ')})` : ''}`);
+    console.log(`❌ 失败: ${failedUsers.length} 个 ${failedUsers.length ? `(${failedUsers.map(u => maskUsernameForLog(u.username) + ':' + u.reason).join('; ')})` : ''}`);
+    if (failedUsers.length > 0) {
+        console.log(`::error::本次执行 ${failedUsers.length}/${users.length} 个账号失败`);
+    }
+    // 写入 GitHub Step Summary
+    if (process.env.GITHUB_STEP_SUMMARY) {
+        try {
+            const summary = [
+                `## Katabump Renew 结果`,
+                ``,
+                `- 总账号: ${users.length}`,
+                `- ✅ 成功: ${succeededUsers.length} ${succeededUsers.map(maskUsernameForLog).join(', ') || ''}`,
+                `- ❌ 失败: ${failedUsers.length}`,
+                ...failedUsers.map(u => `  - ${maskUsernameForLog(u.username)}: ${u.reason}`),
+                ``,
+                hasFailure ? `**状态: 失败 (exit 1)**` : `**状态: 全部成功**`
+            ].join('\n');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n');
+        } catch (e) {
+            console.log('[Summary] 写入失败:', e.message);
+        }
+    }
+
     console.log('完成。');
-    await browser.close();
-    process.exit(0);
+    try { await browser.close(); } catch (e) {}
+    if (hasFailure) {
+        console.error(`\n❌ 检测到 ${failedUsers.length} 个账号处理失败，Action 将以失败状态退出 (exit 1)`);
+        process.exit(1);
+    } else {
+        console.log(`\n✅ 全部 ${succeededUsers.length} 个账号处理成功`);
+        process.exit(0);
+    }
 })();
